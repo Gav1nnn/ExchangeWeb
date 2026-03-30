@@ -5,6 +5,7 @@ import (
 	"errors"
 	"exchangeapp/global"
 	"exchangeapp/models"
+	"exchangeapp/services"
 	"net/http"
 	"time"
 
@@ -23,11 +24,6 @@ func CreateArticle(ctx *gin.Context) {
 		return
 	}
 
-	if err := global.Db.AutoMigrate(&article); err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
 	if err := global.Db.Create(&article).Error; err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -37,6 +33,8 @@ func CreateArticle(ctx *gin.Context) {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	services.RAG.Invalidate()
 
 	ctx.JSON(http.StatusCreated, article)
 }

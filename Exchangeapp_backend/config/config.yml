@@ -11,4 +11,14 @@ redis:
   addr: localhost:6379
   DB: 0
   Password: ""
-  
+
+rag:
+  apiBase: https://api.openai.com/v1
+  apiKey: ""
+  chatModel: gpt-4.1-mini
+  embeddingModel: text-embedding-3-small
+  embeddingDims: 0
+  topK: 3
+  maxContextChars: 1800
+  temperature: 0.2
+  verbosity: medium

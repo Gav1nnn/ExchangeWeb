@@ -27,6 +27,12 @@ func SetupRouter() *gin.Engine {
 		auth.POST("/register", controllers.Register)
 	}
 
+	rag := r.Group("/api/assistant")
+	{
+		rag.GET("/status", controllers.AssistantStatus)
+		rag.POST("/chat", controllers.AssistantChat)
+	}
+
 	api := r.Group("/api")
 	api.GET("/exchangeRates", controllers.GetExchangeRates)
 	api.Use(middlewares.AuthMiddleware())
