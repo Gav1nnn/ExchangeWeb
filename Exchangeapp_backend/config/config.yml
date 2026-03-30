@@ -13,10 +13,10 @@ redis:
   Password: ""
 
 rag:
-  apiBase: https://api.openai.com/v1
+  apiBase: http://localhost:11434
   apiKey: ""
-  chatModel: gpt-4.1-mini
-  embeddingModel: text-embedding-3-small
+  chatModel: qwen3.5:9b
+  embeddingModel: nomic-embed-text
   embeddingDims: 0
   topK: 3
   maxContextChars: 1800

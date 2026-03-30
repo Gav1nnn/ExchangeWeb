@@ -19,9 +19,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
-var tokenPattern = regexp.MustCompile(`[\p{Han}A-Za-z0-9]+`)
+var tokenPattern = regexp.MustCompile(`[\p{Han}]+|[A-Za-z0-9]+`)
 
 type AssistantMessage struct {
 	Role    string `json:"role"`
@@ -58,6 +59,7 @@ type articleChunk struct {
 	Title        string
 	Preview      string
 	Text         string
+	SearchText   string
 	Tokens       []string
 	Fingerprint  string
 	Embedding    []float64
@@ -90,7 +92,7 @@ func NewRAGService() *RAGService {
 	return &RAGService{
 		cacheWindow: 2 * time.Minute,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 5 * time.Minute,
 		},
 	}
 }
@@ -110,10 +112,10 @@ func (s *RAGService) Status(ctx context.Context) (AssistantStatus, error) {
 	}
 
 	status := AssistantStatus{
-		ChatConfigured:      s.canUseResponses(),
+		ChatConfigured:      s.canUseChat(),
 		EmbeddingConfigured: semanticMode,
-		ChatModel:           s.chatModel(),
-		EmbeddingModel:      s.embeddingModel(),
+		ChatModel:           s.statusChatModel(),
+		EmbeddingModel:      s.statusEmbeddingModel(),
 		ChunkCount:          len(chunks),
 	}
 
@@ -201,7 +203,8 @@ func (s *RAGService) getChunks(ctx context.Context) ([]articleChunk, bool, error
 				Title:       article.Title,
 				Preview:     article.Preview,
 				Text:        text,
-				Tokens:      tokenize(text + " " + article.Title + " " + article.Preview),
+				SearchText:  buildSearchText(article.Title, article.Preview, text),
+				Tokens:      tokenize(buildSearchText(article.Title, article.Preview, text)),
 				Fingerprint: chunkFingerprint(article, chunkIndex, text),
 			})
 		}
@@ -279,9 +282,68 @@ func chunkFingerprint(article models.Article, chunkIndex int, text string) strin
 	return hex.EncodeToString(hash[:])
 }
 
+func buildSearchText(parts ...string) string {
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	return strings.Join(filtered, "\n")
+}
+
 func tokenize(text string) []string {
 	lowered := strings.ToLower(text)
-	return tokenPattern.FindAllString(lowered, -1)
+	matches := tokenPattern.FindAllString(lowered, -1)
+	tokens := make([]string, 0, len(matches)*2)
+
+	for _, match := range matches {
+		if match == "" {
+			continue
+		}
+
+		if containsHan(match) {
+			tokens = append(tokens, expandHanTokens(match)...)
+			continue
+		}
+
+		tokens = append(tokens, match)
+	}
+
+	return tokens
+}
+
+func containsHan(text string) bool {
+	for _, r := range text {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func expandHanTokens(text string) []string {
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return nil
+	}
+	if len(runes) == 1 {
+		return []string{text}
+	}
+	if len(runes) == 2 {
+		return []string{text}
+	}
+
+	tokens := make([]string, 0, len(runes))
+	for i := 0; i < len(runes)-1; i++ {
+		tokens = append(tokens, string(runes[i:i+2]))
+	}
+	if len(runes) <= 4 {
+		tokens = append(tokens, text)
+	}
+	return tokens
 }
 
 func frequencyMap(tokens []string) map[string]int {
@@ -327,13 +389,14 @@ func lexicalScore(queryFreq map[string]int, chunk articleChunk) float64 {
 
 func (s *RAGService) retrieve(ctx context.Context, question string, chunks []articleChunk, semanticMode bool) ([]scoredChunk, string) {
 	queryTokens := tokenize(question)
-	if len(queryTokens) == 0 {
+	queryFreq := frequencyMap(queryTokens)
+	if len(queryFreq) == 0 && !semanticMode {
 		return nil, "none"
 	}
 
-	queryFreq := frequencyMap(queryTokens)
 	scored := make([]scoredChunk, 0, len(chunks))
 	maxLexical := 0.0
+	maxSemantic := 0.0
 	for _, chunk := range chunks {
 		score := lexicalScore(queryFreq, chunk)
 		if score > maxLexical {
@@ -357,6 +420,9 @@ func (s *RAGService) retrieve(ctx context.Context, question string, chunks []art
 					continue
 				}
 				scored[index].SemanticScore = cosineSimilarity(queryVector, scored[index].Chunk.Embedding)
+				if scored[index].SemanticScore > maxSemantic {
+					maxSemantic = scored[index].SemanticScore
+				}
 			}
 		}
 	}
@@ -368,16 +434,21 @@ func (s *RAGService) retrieve(ctx context.Context, question string, chunks []art
 		}
 
 		if retrievalMode == "semantic" {
-			semanticNormalized := (scored[index].SemanticScore + 1) / 2
-			scored[index].Score = semanticNormalized*0.8 + lexicalNormalized*0.2
+			semanticNormalized := clampScore(scored[index].SemanticScore)
+			scored[index].Score = semanticNormalized*0.78 + lexicalNormalized*0.22
 		} else {
 			scored[index].Score = lexicalNormalized
 		}
 	}
 
 	filtered := make([]scoredChunk, 0, len(scored))
+	semanticThreshold := semanticCutoff(maxSemantic)
 	for _, item := range scored {
-		if item.Score <= 0 {
+		if retrievalMode == "semantic" {
+			if item.LexicalScore <= 0 && clampScore(item.SemanticScore) < semanticThreshold {
+				continue
+			}
+		} else if item.Score <= 0 {
 			continue
 		}
 		filtered = append(filtered, item)
@@ -424,6 +495,23 @@ func roundScore(score float64) float64 {
 	return math.Round(score*1000) / 1000
 }
 
+func clampScore(score float64) float64 {
+	if score < 0 {
+		return 0
+	}
+	if score > 1 {
+		return 1
+	}
+	return score
+}
+
+func semanticCutoff(maxSemantic float64) float64 {
+	if maxSemantic <= 0 {
+		return 1
+	}
+	return math.Max(0.12, maxSemantic*0.7)
+}
+
 func truncate(text string, maxRunes int) string {
 	runes := []rune(strings.TrimSpace(text))
 	if len(runes) <= maxRunes {
@@ -433,11 +521,11 @@ func truncate(text string, maxRunes int) string {
 }
 
 func (s *RAGService) generate(ctx context.Context, question string, history []AssistantMessage, chunks []scoredChunk) (string, string) {
-	if !s.canUseResponses() {
+	if !s.canUseChat() {
 		return buildFallbackAnswer(question, chunks), "retrieval_only"
 	}
 
-	answer, err := s.generateWithResponses(ctx, question, history, chunks)
+	answer, err := s.generateWithChatCompletions(ctx, question, history, chunks)
 	if err != nil {
 		log.Printf("rag generation failed, using retrieval fallback: %v", err)
 		return buildFallbackAnswer(question, chunks), "retrieval_fallback"
@@ -475,7 +563,7 @@ func (s *RAGService) hydrateEmbeddings(ctx context.Context, chunks []articleChun
 		}
 
 		missingIndexes = append(missingIndexes, index)
-		missingTexts = append(missingTexts, hydrated[index].Text)
+		missingTexts = append(missingTexts, hydrated[index].SearchText)
 	}
 
 	if len(missingTexts) == 0 {
@@ -571,12 +659,9 @@ func (s *RAGService) embedTexts(ctx context.Context, inputs []string) ([][]float
 	}
 
 	payload := map[string]interface{}{
-		"model":           s.embeddingModel(),
-		"input":           inputs,
-		"encoding_format": "float",
-	}
-	if dims := config.AppConfig.RAG.EmbeddingDims; dims > 0 {
-		payload["dimensions"] = dims
+		"model":    s.embeddingModel(),
+		"input":    inputs,
+		"truncate": true,
 	}
 
 	body, err := json.Marshal(payload)
@@ -584,13 +669,13 @@ func (s *RAGService) embedTexts(ctx context.Context, inputs []string) ([][]float
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.apiBase()+"/embeddings", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.embeddingEndpoint(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+config.AppConfig.RAG.APIKey)
+	s.setAuthorizationHeader(req)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -603,28 +688,22 @@ func (s *RAGService) embedTexts(ctx context.Context, inputs []string) ([][]float
 	}
 
 	var response struct {
-		Data []struct {
-			Index     int       `json:"index"`
-			Embedding []float64 `json:"embedding"`
-		} `json:"data"`
+		Embeddings [][]float64 `json:"embeddings"`
+		Embedding  []float64   `json:"embedding"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return nil, err
 	}
 
-	if len(response.Data) != len(inputs) {
-		return nil, fmt.Errorf("embedding provider returned %d vectors for %d inputs", len(response.Data), len(inputs))
+	if len(response.Embeddings) == 0 && len(response.Embedding) > 0 {
+		response.Embeddings = [][]float64{response.Embedding}
 	}
 
-	sort.Slice(response.Data, func(i, j int) bool {
-		return response.Data[i].Index < response.Data[j].Index
-	})
-
-	vectors := make([][]float64, 0, len(response.Data))
-	for _, item := range response.Data {
-		vectors = append(vectors, item.Embedding)
+	if len(response.Embeddings) != len(inputs) {
+		return nil, fmt.Errorf("embedding provider returned %d vectors for %d inputs", len(response.Embeddings), len(inputs))
 	}
-	return vectors, nil
+
+	return response.Embeddings, nil
 }
 
 func cosineSimilarity(left []float64, right []float64) float64 {
@@ -649,55 +728,39 @@ func cosineSimilarity(left []float64, right []float64) float64 {
 	return dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
 }
 
-func (s *RAGService) generateWithResponses(ctx context.Context, question string, history []AssistantMessage, chunks []scoredChunk) (string, error) {
-	input := make([]map[string]interface{}, 0, len(history)+2)
-	input = append(input, map[string]interface{}{
-		"role": "developer",
-		"content": []map[string]string{
-			{
-				"type": "input_text",
-				"text": "你是网站内的专属智能金融客服。你只能依据提供的站内文章上下文回答，不要编造站外事实；如果上下文不足，就明确说明站内资料不足，并引导用户查看引用文章或继续提问。回答使用简体中文，给出清晰、克制、专业的说明。",
-			},
-		},
+func (s *RAGService) generateWithChatCompletions(ctx context.Context, question string, history []AssistantMessage, chunks []scoredChunk) (string, error) {
+	messages := make([]map[string]string, 0, len(history)+2)
+	messages = append(messages, map[string]string{
+		"role":    "system",
+		"content": "你是网站内的专属智能金融客服。你只能依据提供的站内文章上下文回答，不要编造站外事实；如果上下文不足，就明确说明站内资料不足，并引导用户查看引用文章或继续提问。回答使用简体中文，先直接回答用户问题，再用1到3点解释依据；如果引用了上下文，请自然点明来自哪些文章。",
 	})
 
 	for _, message := range trimHistory(history, 8) {
 		role := normalizeHistoryRole(message.Role)
-		if role == "" || strings.TrimSpace(message.Content) == "" {
+		content := strings.TrimSpace(message.Content)
+		if role == "" || content == "" {
 			continue
 		}
-		input = append(input, map[string]interface{}{
-			"role": role,
-			"content": []map[string]string{
-				{
-					"type": "input_text",
-					"text": message.Content,
-				},
-			},
+
+		messages = append(messages, map[string]string{
+			"role":    role,
+			"content": content,
 		})
 	}
 
 	contextText := buildPromptContext(chunks, config.AppConfig.RAG.MaxContextChars)
-	input = append(input, map[string]interface{}{
-		"role": "user",
-		"content": []map[string]string{
-			{
-				"type": "input_text",
-				"text": fmt.Sprintf("站内文章上下文：\n%s\n\n用户问题：%s", contextText, question),
-			},
-		},
+	messages = append(messages, map[string]string{
+		"role":    "user",
+		"content": fmt.Sprintf("站内文章上下文：\n%s\n\n用户问题：%s", contextText, question),
 	})
 
 	payload := map[string]interface{}{
-		"model":       s.chatModel(),
-		"input":       input,
-		"temperature": normalizeTemperature(config.AppConfig.RAG.Temperature),
-	}
-
-	if verbosity := strings.TrimSpace(config.AppConfig.RAG.Verbosity); verbosity != "" {
-		payload["text"] = map[string]interface{}{
-			"verbosity": verbosity,
-		}
+		"model":    s.chatModel(),
+		"messages": messages,
+		"stream":   false,
+		"options": map[string]interface{}{
+			"temperature": normalizeTemperature(config.AppConfig.RAG.Temperature),
+		},
 	}
 
 	body, err := json.Marshal(payload)
@@ -705,13 +768,13 @@ func (s *RAGService) generateWithResponses(ctx context.Context, question string,
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.apiBase()+"/responses", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.chatEndpoint(), bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+config.AppConfig.RAG.APIKey)
+	s.setAuthorizationHeader(req)
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -720,35 +783,55 @@ func (s *RAGService) generateWithResponses(ctx context.Context, question string,
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusBadRequest {
-		return "", fmt.Errorf("responses api returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("chat completions api returned status %d", resp.StatusCode)
 	}
 
 	var response struct {
-		OutputText string `json:"output_text"`
-		Output     []struct {
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"output"`
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return "", err
 	}
 
-	if text := strings.TrimSpace(response.OutputText); text != "" {
+	content, err := extractChatMessageContent(response.Message.Content)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content) != "" {
+		return strings.TrimSpace(content), nil
+	}
+
+	return "", errors.New("ollama chat api returned empty output")
+}
+
+func extractChatMessageContent(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 {
+		return "", nil
+	}
+
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
 		return text, nil
 	}
 
-	for _, item := range response.Output {
-		for _, content := range item.Content {
-			if content.Type == "output_text" && strings.TrimSpace(content.Text) != "" {
-				return strings.TrimSpace(content.Text), nil
-			}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return "", err
+	}
+
+	segments := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part.Type == "text" || part.Type == "output_text" {
+			segments = append(segments, part.Text)
 		}
 	}
 
-	return "", errors.New("responses api returned empty output")
+	return strings.Join(segments, "\n"), nil
 }
 
 func buildPromptContext(chunks []scoredChunk, maxChars int) string {
@@ -777,6 +860,9 @@ func buildPromptContext(chunks []scoredChunk, maxChars int) string {
 func normalizeHistoryRole(role string) string {
 	switch role {
 	case "user", "assistant", "system", "developer":
+		if role == "developer" {
+			return "system"
+		}
 		return role
 	default:
 		return ""
@@ -806,33 +892,57 @@ func normalizeTemperature(value float64) float64 {
 func (s *RAGService) apiBase() string {
 	base := strings.TrimRight(config.AppConfig.RAG.APIBase, "/")
 	if base == "" {
-		return "https://api.openai.com/v1"
+		return "http://127.0.0.1:11434"
 	}
+	base = strings.TrimSuffix(base, "/v1")
+	base = strings.TrimSuffix(base, "/api")
 	return base
 }
 
+func (s *RAGService) chatEndpoint() string {
+	return s.apiBase() + "/api/chat"
+}
+
+func (s *RAGService) embeddingEndpoint() string {
+	return s.apiBase() + "/api/embed"
+}
+
 func (s *RAGService) chatModel() string {
-	model := strings.TrimSpace(config.AppConfig.RAG.ChatModel)
-	if model == "" {
-		return "gpt-4.1-mini"
-	}
-	return model
+	return strings.TrimSpace(config.AppConfig.RAG.ChatModel)
 }
 
 func (s *RAGService) embeddingModel() string {
-	model := strings.TrimSpace(config.AppConfig.RAG.EmbeddingModel)
+	return strings.TrimSpace(config.AppConfig.RAG.EmbeddingModel)
+}
+
+func (s *RAGService) statusChatModel() string {
+	model := s.chatModel()
 	if model == "" {
-		return "text-embedding-3-small"
+		return "未配置"
 	}
 	return model
 }
 
-func (s *RAGService) canUseResponses() bool {
-	return strings.TrimSpace(config.AppConfig.RAG.APIKey) != "" && s.chatModel() != ""
+func (s *RAGService) statusEmbeddingModel() string {
+	model := s.embeddingModel()
+	if model == "" {
+		return "关键词检索"
+	}
+	return model
+}
+
+func (s *RAGService) canUseChat() bool {
+	return s.chatModel() != ""
 }
 
 func (s *RAGService) canUseEmbeddings() bool {
-	return strings.TrimSpace(config.AppConfig.RAG.APIKey) != "" && s.embeddingModel() != ""
+	return s.embeddingModel() != ""
+}
+
+func (s *RAGService) setAuthorizationHeader(req *http.Request) {
+	if apiKey := strings.TrimSpace(config.AppConfig.RAG.APIKey); apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 }
 
 func (s *RAGService) embeddingCacheKey(fingerprint string) string {

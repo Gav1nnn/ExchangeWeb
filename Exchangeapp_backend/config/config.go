@@ -53,19 +53,19 @@ func InitConfig() {
 		log.Fatalf("Unable to decode into struct :%v", err)
 	}
 
-	if apiKey := os.Getenv("EXCHANGEAPP_RAG_API_KEY"); apiKey != "" {
+	if apiKey, ok := os.LookupEnv("EXCHANGEAPP_RAG_API_KEY"); ok {
 		AppConfig.RAG.APIKey = apiKey
 	}
 
-	if apiBase := os.Getenv("EXCHANGEAPP_RAG_API_BASE"); apiBase != "" {
+	if apiBase, ok := os.LookupEnv("EXCHANGEAPP_RAG_API_BASE"); ok {
 		AppConfig.RAG.APIBase = apiBase
 	}
 
-	if chatModel := os.Getenv("EXCHANGEAPP_RAG_CHAT_MODEL"); chatModel != "" {
+	if chatModel, ok := os.LookupEnv("EXCHANGEAPP_RAG_CHAT_MODEL"); ok {
 		AppConfig.RAG.ChatModel = chatModel
 	}
 
-	if embeddingModel := os.Getenv("EXCHANGEAPP_RAG_EMBEDDING_MODEL"); embeddingModel != "" {
+	if embeddingModel, ok := os.LookupEnv("EXCHANGEAPP_RAG_EMBEDDING_MODEL"); ok {
 		AppConfig.RAG.EmbeddingModel = embeddingModel
 	}
 
