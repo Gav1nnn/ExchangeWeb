@@ -14,7 +14,7 @@ func SetupRouter() *gin.Engine {
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:5173"},
-		AllowMethods:     []string{"GET", "POST", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
@@ -39,8 +39,11 @@ func SetupRouter() *gin.Engine {
 	{
 		api.POST("/exchangeRates", controllers.CreateExchangeRate)
 		api.POST("/articles", controllers.CreateArticle)
+		api.GET("/my-articles", controllers.GetMyArticles)
 		api.GET("/articles", controllers.GetArticles)
 		api.GET("/articles/:id", controllers.GetArticlesByID)
+		api.PUT("/articles/:id", controllers.UpdateArticle)
+		api.DELETE("/articles/:id", controllers.DeleteArticle)
 
 		api.POST("/articles/:id/like", controllers.LikeArticle)
 		api.GET("/articles/:id/like", controllers.GetArticleLikes)
