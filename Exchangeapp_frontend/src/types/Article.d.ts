@@ -1,8 +1,11 @@
 export interface Article {
-    ID: string;
+    ID: number;
     Title: string;
     Preview: string;
     Content: string;
+    AuthorUsername: string;
+    CreatedAt: string;
+    UpdatedAt: string;
 }
 
 export interface Like{
